@@ -1,0 +1,96 @@
+name: Build Whisper Offline APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: "whisper.cpp tag or branch to build against"
+        default: "v1.7.5"
+      language:
+        description: "Transcription language: bn, en, or auto (auto = detect per 30s chunk)"
+        default: "bn"
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      WHISPER_REF: ${{ github.event.inputs.whisper_ref || 'v1.7.5' }}
+      LANG_CODE: ${{ github.event.inputs.language || 'bn' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Accept Android SDK licenses
+        run: |
+          set +o pipefail
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Fetch whisper.cpp
+        run: git clone --depth 1 --branch "$WHISPER_REF" https://github.com/ggml-org/whisper.cpp.git whisper.cpp
+
+      - name: Overlay our app onto whisper.cpp's Android project
+        run: |
+          set -euo pipefail
+          W=whisper.cpp/examples/whisper.android
+          ls "$W" "$W/app"
+          test -f "$W/app/build.gradle" || { echo "::error::app/build.gradle not found (project layout changed). Try another whisper_ref."; exit 1; }
+
+          # replace the example UI with ours
+          rm -rf "$W/app/src/main/java" "$W/app/src/main/kotlin" "$W/app/src/test" "$W/app/src/androidTest" "$W/app/src/main/AndroidManifest.xml"
+          mkdir -p "$W/app/src/main/java/com/whispercpp/transcriber"
+          cp android-app/MainActivity.kt "$W/app/src/main/java/com/whispercpp/transcriber/MainActivity.kt"
+          cp android-app/AndroidManifest.xml "$W/app/src/main/AndroidManifest.xml"
+
+          # the example hardcodes English; set our language instead
+          J="$W/lib/src/main/jni/whisper/jni.c"
+          grep -n 'language' "$J" || true
+          grep -qE 'language *= *"[a-z]+"' "$J" || { echo "::error::could not find language setting in jni.c"; exit 1; }
+          sed -i -E "s/(language *= *)\"[a-z]+\"/\1\"${LANG_CODE}\"/" "$J"
+          grep -n 'language' "$J" || true
+
+          # no minify (would break JNI names), no lint failures, add coroutines
+          sed -i -E 's/minifyEnabled true/minifyEnabled false/; s/shrinkResources true/shrinkResources false/' "$W/app/build.gradle"
+          cat >> "$W/app/build.gradle" <<'GRADLE'
+
+          dependencies {
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+          }
+          android {
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+          }
+          GRADLE
+          tail -15 "$W/app/build.gradle"
+
+      - name: Build release APK (release = optimised native code, much faster than debug)
+        working-directory: whisper.cpp/examples/whisper.android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon -Pandroid.injected.build.abi=arm64-v8a
+
+      - name: Sign APK
+        run: |
+          set -euo pipefail
+          W=whisper.cpp/examples/whisper.android
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          APK=$(find "$W/app/build/outputs/apk/release" -name '*.apk' | head -1)
+          echo "Built: $APK"
+          keytool -genkeypair -keystore ci.jks -alias ci -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android -dname "CN=Whisper Offline"
+          "$BT/zipalign" -p -f 4 "$APK" aligned.apk
+          "$BT/apksigner" sign --ks ci.jks --ks-pass pass:android --key-pass pass:android \
+            --out WhisperOffline.apk aligned.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhisperOffline-apk
+          path: WhisperOffline.apk
