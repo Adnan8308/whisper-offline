@@ -7,7 +7,7 @@ on:
         description: "whisper.cpp tag or branch to build against"
         default: "v1.7.5"
       language:
-        description: "Transcription language: bn, en, or auto (auto = detect per 30s chunk)"
+        description: "Transcription language: bn, en, or auto"
         default: "bn"
   push:
     branches: [main, master]
@@ -40,22 +40,60 @@ jobs:
           set -euo pipefail
           W=whisper.cpp/examples/whisper.android
           ls "$W" "$W/app"
-          test -f "$W/app/build.gradle" || { echo "::error::app/build.gradle not found (project layout changed). Try another whisper_ref."; exit 1; }
+          test -f "$W/app/build.gradle" || { echo "::error::app/build.gradle not found"; exit 1; }
 
-          # replace the example UI with ours
           rm -rf "$W/app/src/main/java" "$W/app/src/main/kotlin" "$W/app/src/test" "$W/app/src/androidTest" "$W/app/src/main/AndroidManifest.xml"
           mkdir -p "$W/app/src/main/java/com/whispercpp/transcriber"
           cp android-app/MainActivity.kt "$W/app/src/main/java/com/whispercpp/transcriber/MainActivity.kt"
           cp android-app/AndroidManifest.xml "$W/app/src/main/AndroidManifest.xml"
 
-          # the example hardcodes English; set our language instead
+          # ---- app icon (white background + black microphone) ----
+          R="$W/app/src/main/res"
+          mkdir -p "$R/drawable" "$R/mipmap-anydpi" "$R/mipmap-anydpi-v26"
+          cat > "$R/drawable/whisper_icon_bg.xml" <<'XML'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#FFFFFF" android:pathData="M0,0h108v108h-108z"/>
+          </vector>
+          XML
+          cat > "$R/drawable/whisper_icon_fg.xml" <<'XML'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#000000"
+                  android:pathData="M46,40a8,8 0 0,1 16,0L62,52a8,8 0 0,1 -16,0Z"/>
+              <path android:strokeColor="#000000" android:strokeWidth="3" android:strokeLineCap="round"
+                  android:pathData="M40,50a14,14 0 0,0 28,0"/>
+              <path android:strokeColor="#000000" android:strokeWidth="3" android:strokeLineCap="round"
+                  android:pathData="M54,64L54,72"/>
+              <path android:strokeColor="#000000" android:strokeWidth="3" android:strokeLineCap="round"
+                  android:pathData="M47,73L61,73"/>
+              <path android:strokeColor="#FF444444" android:strokeWidth="3" android:strokeLineCap="round"
+                  android:pathData="M30,48L30,58M36,43L36,63M72,43L72,63M78,48L78,58"/>
+          </vector>
+          XML
+          cat > "$R/mipmap-anydpi-v26/whisper_icon.xml" <<'XML'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/whisper_icon_bg"/>
+              <foreground android:drawable="@drawable/whisper_icon_fg"/>
+          </adaptive-icon>
+          XML
+          cat > "$R/mipmap-anydpi/whisper_icon.xml" <<'XML'
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:drawable="@drawable/whisper_icon_bg"/>
+              <item android:drawable="@drawable/whisper_icon_fg"/>
+          </layer-list>
+          XML
+          sed -i 's|<application|<application android:icon="@mipmap/whisper_icon" android:roundIcon="@mipmap/whisper_icon"|' "$W/app/src/main/AndroidManifest.xml"
+          grep -n 'icon' "$W/app/src/main/AndroidManifest.xml"
+
           J="$W/lib/src/main/jni/whisper/jni.c"
           grep -n 'language' "$J" || true
           grep -qE 'language *= *"[a-z]+"' "$J" || { echo "::error::could not find language setting in jni.c"; exit 1; }
           sed -i -E "s/(language *= *)\"[a-z]+\"/\1\"${LANG_CODE}\"/" "$J"
           grep -n 'language' "$J" || true
 
-          # no minify (would break JNI names), no lint failures, add coroutines
           sed -i -E 's/minifyEnabled true/minifyEnabled false/; s/shrinkResources true/shrinkResources false/' "$W/app/build.gradle"
           cat >> "$W/app/build.gradle" <<'GRADLE'
 
@@ -71,19 +109,30 @@ jobs:
           GRADLE
           tail -15 "$W/app/build.gradle"
 
-      - name: Build release APK (release = optimised native code, much faster than debug)
+      - name: Build APK
         working-directory: whisper.cpp/examples/whisper.android
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon -Pandroid.injected.build.abi=arm64-v8a
+          if ! find . -path '*/build/outputs/apk/*' -name '*.apk' | grep -q .; then
+            echo "::warning::No release APK produced, falling back to debug build (slower on phone)"
+            ./gradlew assembleDebug --no-daemon -Pandroid.injected.build.abi=arm64-v8a
+          fi
 
       - name: Sign APK
         run: |
           set -euo pipefail
           W=whisper.cpp/examples/whisper.android
+          echo "--- every apk/aab found ---"
+          find "$W" \( -name '*.apk' -o -name '*.aab' \) || true
+          APK=$(find "$W" -path '*/build/outputs/apk/*' -name '*.apk' | grep -v androidTest | head -1 || true)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK was produced. Build outputs:"
+            find "$W" -maxdepth 5 -path '*/build/outputs*' | head -60
+            exit 1
+          fi
+          echo "Using: $APK"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          APK=$(find "$W/app/build/outputs/apk/release" -name '*.apk' | head -1)
-          echo "Built: $APK"
           keytool -genkeypair -keystore ci.jks -alias ci -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass android -keypass android -dname "CN=Whisper Offline"
           "$BT/zipalign" -p -f 4 "$APK" aligned.apk
