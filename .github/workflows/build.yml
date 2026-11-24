@@ -114,7 +114,7 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon -Pandroid.injected.build.abi=arm64-v8a
-          if ! find . -path '*/build/outputs/apk/*' -name '*.apk' | grep -q .; then
+          if ! find . -name 'app-release*.apk' | grep -q .; then
             echo "::warning::No release APK produced, falling back to debug build (slower on phone)"
             ./gradlew assembleDebug --no-daemon -Pandroid.injected.build.abi=arm64-v8a
           fi
@@ -125,7 +125,8 @@ jobs:
           W=whisper.cpp/examples/whisper.android
           echo "--- every apk/aab found ---"
           find "$W" \( -name '*.apk' -o -name '*.aab' \) || true
-          APK=$(find "$W" -path '*/build/outputs/apk/*' -name '*.apk' | grep -v androidTest | head -1 || true)
+          APK=$(find "$W/app/build" -name 'app-release*.apk' | head -1 || true)
+          if [ -z "$APK" ]; then APK=$(find "$W/app/build" -name 'app-debug*.apk' | head -1 || true); fi
           if [ -z "$APK" ]; then
             echo "::error::No APK was produced. Build outputs:"
             find "$W" -maxdepth 5 -path '*/build/outputs*' | head -60
